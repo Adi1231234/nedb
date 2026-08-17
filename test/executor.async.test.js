@@ -4,7 +4,8 @@ const { promises: fs } = require('fs')
 const assert = require('assert').strict
 const Datastore = require('../lib/datastore')
 const Persistence = require('../lib/persistence')
-const { exists } = require('./utils.test.js')
+const Executor = require('../lib/executor')
+const { exists, wait } = require('./utils.test.js')
 
 // Test that operations are executed in the right order
 // We prevent Mocha from catching the exception we throw on purpose by remembering all current handlers, remove them and register them back after test ends
@@ -80,3 +81,67 @@ describe('With non persistent database', function () {
 
   it('Works in the right order even with no supplied callback', () => testExecutorWorksWithoutCallback(d))
 }) // ==== End of 'With non persistent database' ====
+
+describe('processBuffer chains the buffer into the main queue', function () {
+  it('A task pushed after processBuffer does not start before the buffer has drained', async () => {
+    const executor = new Executor()
+    const events = []
+
+    const buffered = executor.pushAsync(async () => {
+      events.push('buffered start')
+      await wait(50)
+      events.push('buffered end')
+    })
+
+    executor.processBuffer()
+
+    const queued = executor.pushAsync(async () => { events.push('queued start') })
+
+    await Promise.all([buffered, queued])
+    assert.deepEqual(events, ['buffered start', 'buffered end', 'queued start'])
+  })
+
+  it('processBuffer makes the main queue wait on the buffer', async () => {
+    const executor = new Executor()
+    executor.pushAsync(async () => wait(20))
+
+    const guardianBefore = executor.queue.guardian
+    executor.processBuffer()
+    assert.notEqual(executor.queue.guardian, guardianBefore)
+
+    await executor.queue.guardian
+  })
+
+  it('A remove queued while a buffered compaction runs is not dropped from the datafile', async () => {
+    const d = new Datastore({ filename: testDb })
+    await Persistence.ensureParentDirectoryExistsAsync(testDb)
+    if (await exists(testDb)) await fs.unlink(testDb)
+    await d.loadDatabaseAsync()
+    for (let i = 0; i < 10; i++) await d.insertAsync({ _id: `doc${i}`, i })
+    await d.compactDatafileAsync()
+
+    let removal = null
+    d.persistence.afterSerialization = async s => {
+      if (removal === null) {
+        removal = d.removeAsync({ _id: 'doc7' }, {})
+        await wait(5)
+      }
+      return s
+    }
+
+    d.executor.ready = false
+    d.executor.resetBuffer()
+
+    const compaction = d.compactDatafileAsync()
+    d.executor.processBuffer()
+
+    await compaction
+    await removal
+
+    assert.equal(d.getAllData().length, 9)
+    const reloaded = new Datastore({ filename: testDb })
+    await reloaded.loadDatabaseAsync()
+    assert.equal(reloaded.getAllData().length, 9)
+    assert.equal((await reloaded.findAsync({ _id: 'doc7' })).length, 0)
+  })
+}) // ==== End of 'processBuffer chains the buffer into the main queue' ====
